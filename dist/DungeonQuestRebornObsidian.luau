@@ -794,7 +794,11 @@ local function castAbilities(now)
     if now - Combat.lastSkill < gap then return end
     local ch, hum = player.Character, player.Character and player.Character:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return end
-    if player.Character:FindFirstChild("busyCasting") then return end
+    local busy = player.Character:FindFirstChild("busyCasting")
+    if busy and busy.Value == true then return end
+    local peace = player:FindFirstChild("peaceful")
+    if peace and peace.Value == true then return end
+    if UIS:GetFocusedTextBox() then return end
     local slots = abilityTools()
     local order = Combat.useQ and { "q", "e" } or { "e", "q" }
     for _, s in ipairs(order) do
@@ -1622,6 +1626,14 @@ connect(RunService.Heartbeat, function()
             end
         else
             clearBeam()
+            -- Auto Abilities works even when farm movement is off.
+            if C.AutoAbilities then
+                local foe, _ = pickFoe(root, now)
+                local foeRoot = foe and modelRoot(foe)
+                if foe and foeRoot and (foeRoot.Position - root.Position).Magnitude <= math.max(8, C.AbilityRange) then
+                    castAbilities(now)
+                end
+            end
         end
         -- death counting
         local key = "me_" .. hum:GetDebugId()
