@@ -28,7 +28,7 @@ local C = {
     AutoDungeon = false, FarmPosition = "Nearest", BossDistance = 20, AbilityRange = 26,
     MoveSpeed = 16, MoveSpeedEnabled = false, StartDelay = 0,
     AutoAbilities = true, SpamAbilities = false, AutoDodge = true, AutoReplay = false,
-    DodgeSafety = 3, DynamicDistance = false, MeleeDistance = 8,
+    DodgeSafety = 3, DodgeDistance = 6, DynamicDistance = false, MeleeDistance = 8,
     -- Carry finder
     CarryFinder = false, CarryHost = "", BestProgression = true,
     CarryDungeons = {}, CarryDifficulties = { "Insane", "Nightmare" },
@@ -387,7 +387,7 @@ local Combat = {
     useQ = true, qCasts = 0, eCasts = 0,
     waypoints = {}, wpIndex = 1, pathObj = nil, pathAt = 0, pathBusy = false,
     lastPos = Vector3.zero, stuckSince = 0, recoveries = 0,
-    dodgeAt = 0, dodgeLog = {}, dodgeSide = 1, threats = {},
+    dodgeAt = 0, dodgeLog = {}, dodgeSide = 1, threats = {}, zones = {},
     folder = nil, nodes = {},
 }
 local trackedHumanoids = {}
@@ -407,6 +407,34 @@ for _, inst in ipairs(Workspace:GetDescendants()) do
     if inst:IsA("Humanoid") and inst.Parent and inst.Parent:IsA("Model") then trackedHumanoids[inst] = inst.Parent end
     if inst:IsA("BasePart") and not inst.CanCollide then Combat.threats[inst] = { born = os.clock(), pos = inst.Position, at = os.clock() } end
 end
+-- Early precast telegraphs: the server announces Circle/Cube zones over
+-- BridgeNet2 before the visible parts fade in (they spawn at Transparency 1).
+pcall(function()
+    local bridge = require(RS:WaitForChild("Utility"):WaitForChild("BridgeNet2"))
+    local actionId = bridge.ReferenceIdentifier("action")
+    local conn = bridge.ReferenceBridge("precastHitbox"):Connect(function(data)
+        if not alive or type(data) ~= "table" then return end
+        local kind = data[actionId]
+        local now = os.clock()
+        local serverNow
+        pcall(function() serverNow = Workspace:GetServerTimeNow() end)
+        serverNow = serverNow or 0
+        if kind == "Circle" and typeof(data.position) == "Vector3" and type(data.radius) == "number" then
+            local remain = (tonumber(data.delayUntilAttack) or 0) - (serverNow - (tonumber(data.startTime) or serverNow))
+            if remain > -0.4 then
+                table.insert(Combat.zones, { shape = "circle", pos = data.position, radius = data.radius,
+                    expires = now + math.max(0, remain) + 0.5 })
+            end
+        elseif kind == "Cube" and typeof(data.cframe) == "CFrame" and typeof(data.size) == "Vector3" then
+            local remain = (tonumber(data.delayUntilAttack) or 0) - (serverNow - (tonumber(data.startTime) or serverNow))
+            if remain > -0.4 then
+                table.insert(Combat.zones, { shape = "box", cf = data.cframe, size = data.size,
+                    expires = now + math.max(0, remain) + 0.5 })
+            end
+        end
+    end)
+    table.insert(hooks, conn)
+end)
 
 local function charParts()
     local ch = player.Character
@@ -538,6 +566,12 @@ local function drawWP()
     end
 end
 local function gotoPos(hum, root, goal, mode, now)
+    -- Never willingly walk into an announced telegraph.
+    if C.AutoDodge and not pointSafe(goal, Combat.target and modelRoot(Combat.target), now) then
+        local safe = false
+        for _, z in ipairs(activeZones(now)) do safe = true break end
+        if safe then hum:MoveTo(root.Position); return end
+    end
     if (goal - root.Position).Magnitude <= 42 and not rayBlocked(root.Position, goal, hum.Parent, Combat.target) then
         if Combat.pathObj then clearWP() end
         hum:MoveTo(goal)
@@ -592,53 +626,150 @@ local function updateStuck(hum, root, goal, now)
     local cand = root.Position + side * 6
     if not rayBlocked(root.Position, cand, hum.Parent, Combat.target) then hum:MoveTo(cand) end
 end
+local function zoneHits(zone, p, pad)
+    pad = pad or C.DodgeSafety
+    if zone.shape == "circle" and zone.pos then
+        local flat = Vector3.new(p.X - zone.pos.X, 0, p.Z - zone.pos.Z)
+        return flat.Magnitude <= (zone.radius or 0) + pad
+    elseif zone.shape == "box" and zone.cf and zone.size then
+        local lp = zone.cf:PointToObjectSpace(p)
+        return math.abs(lp.X) <= zone.size.X / 2 + pad
+            and math.abs(lp.Z) <= zone.size.Z / 2 + pad
+            and math.abs(lp.Y) <= zone.size.Y / 2 + 5
+    end
+    return false
+end
+local function activeZones(now)
+    local out = {}
+    for i = #Combat.zones, 1, -1 do
+        if Combat.zones[i].expires < now then table.remove(Combat.zones, i)
+        else table.insert(out, Combat.zones[i]) end
+    end
+    return out
+end
+local function pointSafe(p, foeRoot, now)
+    for _, z in ipairs(activeZones(now)) do
+        if zoneHits(z, p) then return false end
+    end
+    return true
+end
 local function senseThreat(root, foe, now)
     if not C.AutoDodge then return nil end
+    -- 1) Announced precast zones first: dodge as soon as we stand inside one,
+    -- even while the part is still fading in.
+    for _, z in ipairs(activeZones(now)) do
+        if zoneHits(z, root.Position) then
+            local c = z.shape == "circle" and { Position = z.pos } or { Position = z.cf.Position, CFrame = z.cf, Size = z.size }
+            return c
+        end
+    end
+    local foeRoot = foe and modelRoot(foe)
     for part, s in pairs(Combat.threats) do
-        if not part.Parent or now - s.born > 2 then Combat.threats[part] = nil
-        elseif part.Transparency < 0.9 then
-            local nm = (part.Name .. " " .. part.Parent.Name):lower()
-            local risky = nm:find("attack") or nm:find("hitbox") or nm:find("precast") or nm:find("projectile") or nm:find("telegraph") or nm:find("danger")
+        if not part.Parent or now - s.born > 2.5 then Combat.threats[part] = nil
+        else
             local d = (part.Position - root.Position).Magnitude
-            if risky and d < 30 then
-                local lp = part.CFrame:PointToObjectSpace(root.Position)
-                if math.abs(lp.X) < part.Size.X / 2 + C.DodgeSafety and math.abs(lp.Z) < part.Size.Z / 2 + C.DodgeSafety and math.abs(lp.Y) < part.Size.Y / 2 + 4 then
+            if d < 45 then
+                local nm = (part.Name .. " " .. part.Parent.Name):lower()
+                local mdl = part:FindFirstAncestorOfClass("Model")
+                local mdlN = mdl and mdl.Name:lower() or ""
+                local named = nm:find("attack") or nm:find("hitbox") or nm:find("precast")
+                    or nm:find("projectile") or nm:find("telegraph") or nm:find("danger") or nm:find("warning")
+                -- Projectile motion: AssemblyLinearVelocity or observed displacement.
+                local elapsed = math.max(now - s.at, 1 / 60)
+                local observed = (part.Position - s.pos) / elapsed
+                local vel = part.AssemblyLinearVelocity
+                if vel.Magnitude < 1 then vel = observed end
+                s.pos, s.at = part.Position, now
+                local toMe = root.Position - part.Position
+                local heading = (vel.Magnitude > 1 and toMe.Magnitude > 0.01) and vel.Unit:Dot(toMe.Unit) or 0
+                local tta = vel.Magnitude > 1 and toMe.Magnitude / vel.Magnitude or math.huge
+                local isProj = (mdlN:find("shot") or mdlN:find("projectile") or mdlN:find("missile")
+                    or mdlN:find("orb") or mdlN:find("bomb") or mdlN:find("beam"))
+                local swept = (root.Position - s.pos).Magnitude <= 8
+                local projThreat = isProj and (d < 9 or swept or (heading > 0.1 and tta <= 1.35))
+                -- Red neon precast clustered around the locked enemy.
+                local col = part.Color
+                local redPre = part.Material == Enum.Material.Neon and not part.CanCollide
+                    and part.Size.Magnitude > 5 and col.R > col.G * 1.3 and col.R > col.B * 1.2
+                    and foeRoot and (part.Position - foeRoot.Position).Magnitude < 32
+                -- Generic large transient precast near the enemy (filters own VFX by recency).
+                local genPre = part.Parent == Workspace and not part.CanCollide and not part.CanQuery
+                    and part.Size.Magnitude > 3 and foeRoot and (part.Position - foeRoot.Position).Magnitude < 42
+                    and now - s.born > 0.1 and now - Combat.lastSkill > 0.35
+                local attr = (part:GetAttribute("Attack") == true or part:GetAttribute("Damage") ~= nil
+                    or part:GetAttribute("Hitbox") == true)
+                local inBox = false
+                do
+                    local lp = part.CFrame:PointToObjectSpace(root.Position)
+                    local sh = part:IsA("Part") and part.Shape or nil
+                    if sh == Enum.PartType.Cylinder then
+                        local r = math.max(part.Size.X, part.Size.Y, part.Size.Z) * 0.5 + C.DodgeSafety
+                        inBox = lp.Magnitude <= r
+                    else
+                        inBox = math.abs(lp.X) <= part.Size.X / 2 + C.DodgeSafety
+                            and math.abs(lp.Z) <= part.Size.Z / 2 + C.DodgeSafety
+                            and math.abs(lp.Y) <= part.Size.Y / 2 + 4
+                    end
+                end
+                if inBox and (projThreat or redPre or genPre or (named and part.Transparency < 0.95) or (attr and d < 30)) then
                     return part
                 end
             end
         end
-        s.pos, s.at = part.Position, now
     end
     return nil
 end
 local function dodgeOk(now, dist)
     while Combat.dodgeLog[1] and now - Combat.dodgeLog[1].at >= 3 do table.remove(Combat.dodgeLog, 1) end
-    if dist < 0.1 or dist > 3.01 then return false end
-    if #Combat.dodgeLog >= 2 then return false end
-    if Combat.dodgeLog[#Combat.dodgeLog] and now - Combat.dodgeLog[#Combat.dodgeLog].at < 1 then return false end
+    local step = math.clamp(C.DodgeDistance, 3, 8)
+    if dist < 0.1 or dist > step + 0.05 then return false end
+    if #Combat.dodgeLog >= 3 then return false end
+    if Combat.dodgeLog[#Combat.dodgeLog] and now - Combat.dodgeLog[#Combat.dodgeLog].at < 0.6 then return false end
     local spent = 0
     for _, e in ipairs(Combat.dodgeLog) do spent += e.d end
-    return spent + dist <= 6.01
+    return spent + dist <= 15.01
+end
+local function groundOk(pos, ch, foe)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { ch, foe }
+    params.IgnoreWater = true
+    local hit = Workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -10, 0), params)
+    return hit ~= nil and hit.Instance.CanCollide
 end
 local function tryDodge(hum, root, foeRoot, threat, now)
     if not threat or hum.FloorMaterial == Enum.Material.Air then return false end
-    local away = root.Position - threat.Position
+    local step = math.clamp(C.DodgeDistance, 3, 8)
+    local tPos = threat.Position or (threat.CFrame and threat.CFrame.Position) or root.Position
+    local away = root.Position - tPos
     away = Vector3.new(away.X, 0, away.Z)
     if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
     away = away.Unit
     local right = Vector3.new(-away.Z, 0, away.X)
-    local cands = { root.Position + right * 3, root.Position - right * 3, root.Position + away * 3 }
+    Combat.dodgeSide = -Combat.dodgeSide
+    local first = Combat.dodgeSide > 0 and right or -right
+    local cands = { root.Position + first * step, root.Position - first * step,
+        root.Position + away * step, root.Position + (first + away).Unit * step * 0.9 }
+    local best, bestScore
     for _, cand in ipairs(cands) do
         cand = Vector3.new(cand.X, root.Position.Y, cand.Z)
         local d = (cand - root.Position).Magnitude
-        if dodgeOk(now, d) and not rayBlocked(root.Position + Vector3.new(0, 2, 0), cand + Vector3.new(0, 2, 0), hum.Parent, Combat.target) then
-            root.CFrame += (cand - root.Position)
-            table.insert(Combat.dodgeLog, { at = now, d = d })
-            Combat.dodgeAt = now
-            clearWP()
-            hum:MoveTo(cand)
-            return true
+        if dodgeOk(now, d) and groundOk(cand, hum.Parent, Combat.target)
+            and not rayBlocked(root.Position + Vector3.new(0, 2, 0), cand + Vector3.new(0, 2, 0), hum.Parent, Combat.target) then
+            -- Prefer spots outside zones and farther from the threat.
+            local safe = pointSafe(cand, foeRoot, now) and 0 or 100
+            local score = safe + math.max(0, 20 - (cand - tPos).Magnitude)
+            if not bestScore or score < bestScore then best, bestScore = cand, score end
         end
+    end
+    if best then
+        root.CFrame += (best - root.Position)
+        table.insert(Combat.dodgeLog, { at = now, d = (best - root.Position).Magnitude })
+        Combat.dodgeAt = now
+        Combat.dodges = (Combat.dodges or 0) + 1
+        clearWP()
+        hum:MoveTo(best)
+        return true
     end
     return false
 end
@@ -936,7 +1067,8 @@ tg(dg, "AutoReplay", "Auto Replay")
 local da = T.Dungeon:AddRightGroupbox("Combat")
 tg(da, "AutoAbilities", "Auto Abilities")
 tg(da, "SpamAbilities", "Spam Abilities (faster checks)")
-tg(da, "AutoDodge", "Auto Dodge (bounded 3-stud)")
+tg(da, "AutoDodge", "Auto Dodge (bounded blink)")
+sl(da, "DodgeDistance", "Dodge Distance", 3, 8)
 sl(da, "DodgeSafety", "Dodge Safety Padding", 0, 10, nil, 1)
 tg(da, "DynamicDistance", "Dynamic Melee Distance")
 sl(da, "MeleeDistance", "Melee Distance", 5, 14)
